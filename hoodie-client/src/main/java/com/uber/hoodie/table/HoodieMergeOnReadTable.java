@@ -1,0 +1,373 @@
+/*
+ * Copyright (c) 2016 Uber Technologies, Inc. (hoodie-dev-group@uber.com)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *          http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.uber.hoodie.table;
+
+import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
+import com.uber.hoodie.WriteStatus;
+import com.uber.hoodie.common.HoodieRollbackStat;
+import com.uber.hoodie.common.model.FileSlice;
+import com.uber.hoodie.common.model.HoodieCommitMetadata;
+import com.uber.hoodie.common.model.HoodieLogFile;
+import com.uber.hoodie.common.model.HoodieRecord;
+import com.uber.hoodie.common.model.HoodieRecordLocation;
+import com.uber.hoodie.common.model.HoodieRecordPayload;
+import com.uber.hoodie.common.model.HoodieWriteStat;
+import com.uber.hoodie.common.table.HoodieTimeline;
+import com.uber.hoodie.common.table.log.HoodieLogFormat;
+import com.uber.hoodie.common.table.log.HoodieLogFormat.Writer;
+import com.uber.hoodie.common.table.log.block.HoodieCommandBlock;
+import com.uber.hoodie.common.table.log.block.HoodieCommandBlock.HoodieCommandBlockTypeEnum;
+import com.uber.hoodie.common.table.log.block.HoodieLogBlock.HeaderMetadataType;
+import com.uber.hoodie.common.table.timeline.HoodieActiveTimeline;
+import com.uber.hoodie.common.table.timeline.HoodieInstant;
+import com.uber.hoodie.common.util.FSUtils;
+import com.uber.hoodie.config.HoodieWriteConfig;
+import com.uber.hoodie.exception.HoodieCompactionException;
+import com.uber.hoodie.exception.HoodieRollbackException;
+import com.uber.hoodie.exception.HoodieUpsertException;
+import com.uber.hoodie.func.MergeOnReadLazyInsertIterable;
+import com.uber.hoodie.index.HoodieIndex;
+import com.uber.hoodie.io.HoodieAppendHandle;
+import com.uber.hoodie.io.compact.HoodieRealtimeTableCompactor;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.PathFilter;
+import org.apache.log4j.LogManager;
+import org.apache.log4j.Logger;
+import org.apache.spark.Partitioner;
+import org.apache.spark.api.java.JavaRDD;
+import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.api.java.function.Function;
+
+/**
+ * Implementation of a more real-time read-optimized Hoodie Table where <p> INSERTS - Same as
+ * HoodieCopyOnWriteTable - Produce new files, block aligned to desired size (or) Merge with the
+ * smallest existing file, to expand it </p> <p> UPDATES - Appends the changes to a rolling log file
+ * maintained per file Id. Compaction merges the log file into the base file. </p> <p> WARNING - MOR
+ * table type does not support nested rollbacks, every rollback must be followed by an attempted
+ * commit action </p>
+ */
+public class HoodieMergeOnReadTable<T extends HoodieRecordPayload> extends
+    HoodieCopyOnWriteTable<T> {
+
+  private static Logger logger = LogManager.getLogger(HoodieMergeOnReadTable.class);
+
+  // UpsertPartitioner for MergeOnRead table type
+  private MergeOnReadUpsertPartitioner mergeOnReadUpsertPartitioner;
+
+  public HoodieMergeOnReadTable(HoodieWriteConfig config, JavaSparkContext jsc) {
+    super(config, jsc);
+  }
+
+  @Override
+  public Partitioner getUpsertPartitioner(WorkloadProfile profile) {
+    if (profile == null) {
+      throw new HoodieUpsertException("Need workload profile to construct the upsert partitioner.");
+    }
+    mergeOnReadUpsertPartitioner = new MergeOnReadUpsertPartitioner(profile);
+    return mergeOnReadUpsertPartitioner;
+  }
+
+  @Override
+  public Iterator<List<WriteStatus>> handleUpdate(String commitTime, String fileId,
+      Iterator<HoodieRecord<T>> recordItr) throws IOException {
+    logger.info("Merging updates for commit " + commitTime + " for file " + fileId);
+
+    if (mergeOnReadUpsertPartitioner.getSmallFileIds().contains(fileId)) {
+      logger.info(
+          "Small file corrections for updates for commit " + commitTime + " for file " + fileId);
+      return super.handleUpdate(commitTime, fileId, recordItr);
+    } else {
+      HoodieAppendHandle<T> appendHandle = new HoodieAppendHandle<>(config, commitTime, this,
+          fileId, recordItr);
+      appendHandle.doAppend();
+      appendHandle.close();
+      return Collections.singletonList(Collections.singletonList(appendHandle.getWriteStatus()))
+          .iterator();
+    }
+  }
+
+  @Override
+  public Iterator<List<WriteStatus>> handleInsert(String commitTime,
+      Iterator<HoodieRecord<T>> recordItr) throws Exception {
+    // If canIndexLogFiles, write inserts to log files else write inserts to parquet files
+    if (index.canIndexLogFiles()) {
+      return new MergeOnReadLazyInsertIterable<>(recordItr, config, commitTime, this);
+    } else {
+      return super.handleInsert(commitTime, recordItr);
+    }
+  }
+
+  @Override
+  public JavaRDD<WriteStatus> compact(JavaSparkContext jsc, String compactionCommitTime) {
+    logger.info("Checking if compaction needs to be run on " + config.getBasePath());
+    Optional<HoodieInstant> lastCompaction = getActiveTimeline().getCommitTimeline()
+        .filterCompletedInstants().lastInstant();
+    String deltaCommitsSinceTs = "0";
+    if (lastCompaction.isPresent()) {
+      deltaCommitsSinceTs = lastCompaction.get().getTimestamp();
+    }
+
+    int deltaCommitsSinceLastCompaction = getActiveTimeline().getDeltaCommitTimeline()
+        .findInstantsAfter(deltaCommitsSinceTs, Integer.MAX_VALUE).countInstants();
+    if (config.getInlineCompactDeltaCommitMax() > deltaCommitsSinceLastCompaction) {
+      logger.info("Not running compaction as only " + deltaCommitsSinceLastCompaction
+          + " delta commits was found since last compaction " + deltaCommitsSinceTs
+          + ". Waiting for " + config.getInlineCompactDeltaCommitMax());
+      return jsc.emptyRDD();
+    }
+
+    logger.info("Compacting merge on read table " + config.getBasePath());
+    HoodieRealtimeTableCompactor compactor = new HoodieRealtimeTableCompactor();
+    try {
+      return compactor.compact(jsc, config, this, compactionCommitTime);
+    } catch (IOException e) {
+      throw new HoodieCompactionException("Could not compact " + config.getBasePath(), e);
+    }
+  }
+
+  @Override
+  public List<HoodieRollbackStat> rollback(JavaSparkContext jsc, List<String> commits)
+      throws IOException {
+
+    //At the moment, MOR table type does not support nested rollbacks
+    if (commits.size() > 1) {
+      throw new UnsupportedOperationException("Nested Rollbacks are not supported");
+    }
+    Map<String, HoodieInstant> commitsAndCompactions = this.getActiveTimeline()
+        .getTimelineOfActions(Sets.newHashSet(HoodieActiveTimeline.COMMIT_ACTION,
+            HoodieActiveTimeline.DELTA_COMMIT_ACTION)).getInstants()
+        .filter(i -> commits.contains(i.getTimestamp()))
+        .collect(Collectors.toMap(i -> i.getTimestamp(), i -> i));
+
+    // Atomically un-publish all non-inflight commits
+    commitsAndCompactions.entrySet().stream().map(entry -> entry.getValue())
+        .filter(i -> !i.isInflight()).forEach(this.getActiveTimeline()::revertToInflight);
+    logger.info("Unpublished " + commits);
+    Long startTime = System.currentTimeMillis();
+    // TODO (NA) : remove this once HoodieIndex is a member of HoodieTable
+    HoodieIndex hoodieIndex = HoodieIndex.createIndex(config, jsc);
+    List<HoodieRollbackStat> allRollbackStats = jsc.parallelize(FSUtils
+        .getAllPartitionPaths(this.metaClient.getFs(), this.getMetaClient().getBasePath(),
+            config.shouldAssumeDatePartitioning()))
+        .map((Function<String, List<HoodieRollbackStat>>) partitionPath -> {
+          return commits.stream().map(commit -> {
+            HoodieInstant instant = commitsAndCompactions.get(commit);
+            HoodieRollbackStat hoodieRollbackStats = null;
+            // Need to put the path filter here since Filter is not serializable
+            // PathFilter to get all parquet files and log files that need to be deleted
+            PathFilter filter = (path) -> {
+              if (path.toString().contains(".parquet")) {
+                String fileCommitTime = FSUtils.getCommitTime(path.getName());
+                return commits.contains(fileCommitTime);
+              } else if (path.toString().contains(".log")) {
+                // Since the baseCommitTime is the only commit for new log files, it's okay here
+                String fileCommitTime = FSUtils.getBaseCommitTimeFromLogPath(path);
+                return commits.contains(fileCommitTime);
+              }
+              return false;
+            };
+
+            switch (instant.getAction()) {
+              case HoodieTimeline.COMMIT_ACTION:
+                try {
+                  Map<FileStatus, Boolean> results = super
+                      .deleteCleanedFiles(partitionPath, Arrays.asList(commit));
+                  hoodieRollbackStats = HoodieRollbackStat.newBuilder()
+                      .withPartitionPath(partitionPath).withDeletedFileResults(results).build();
+                  break;
+                } catch (IOException io) {
+                  throw new UncheckedIOException("Failed to rollback for commit " + commit, io);
+                }
+              case HoodieTimeline.DELTA_COMMIT_ACTION:
+                try {
+                  HoodieCommitMetadata commitMetadata = HoodieCommitMetadata.fromBytes(
+                      metaClient.getCommitTimeline().getInstantDetails(
+                          new HoodieInstant(true, instant.getAction(), instant.getTimestamp()))
+                          .get());
+
+                  // read commit file and (either append delete blocks or delete file)
+                  final Map<FileStatus, Boolean> filesToDeletedStatus = new HashMap<>();
+                  Map<FileStatus, Long> filesToNumBlocksRollback = new HashMap<>();
+
+                  // In case all data was inserts and the commit failed, delete the file belonging to that commit
+                  super.deleteCleanedFiles(filesToDeletedStatus, partitionPath, filter);
+
+                  final Set<String> deletedFiles = filesToDeletedStatus.entrySet().stream()
+                      .map(entry -> {
+                        Path filePath = entry.getKey().getPath();
+                        return FSUtils.getFileIdFromFilePath(filePath);
+                      }).collect(Collectors.toSet());
+                  // append rollback blocks for updates
+                  if (commitMetadata.getPartitionToWriteStats().containsKey(partitionPath)) {
+                    // This needs to be done since GlobalIndex at the moment does not store the latest commit time
+                    Map<String, String> fileIdToLatestCommitTimeMap =
+                        hoodieIndex.isGlobal() ? this.getRTFileSystemView().getLatestFileSlices(partitionPath)
+                            .collect(Collectors.toMap(FileSlice::getFileId, FileSlice::getBaseCommitTime)) : null;
+                    commitMetadata.getPartitionToWriteStats().get(partitionPath).stream()
+                        .filter(wStat -> {
+                          if (wStat != null
+                              && wStat.getPrevCommit() != HoodieWriteStat.NULL_COMMIT
+                              && wStat.getPrevCommit() != null && !deletedFiles.contains(wStat.getFileId())) {
+                            return true;
+                          }
+                          return false;
+                        })
+                        .forEach(wStat -> {
+                          Writer writer = null;
+                          String baseCommitTime = wStat.getPrevCommit();
+                          if (hoodieIndex.isGlobal()) {
+                            baseCommitTime = fileIdToLatestCommitTimeMap.get(wStat.getFileId());
+                          }
+                          try {
+                            // TODO : wStat.getPrevCommit() might not give the right commit time in the following
+                            // scenario if a compaction was scheduled, the new commitTime will be used to write the
+                            // new log file. In this case, the commit time for the log file is the
+                            // getBaseCommitTime()
+                            writer = HoodieLogFormat.newWriterBuilder().onParentPath(
+                                new Path(this.getMetaClient().getBasePath(), partitionPath))
+                                .withFileId(wStat.getFileId()).overBaseCommit(baseCommitTime)
+                                .withFs(this.metaClient.getFs())
+                                .withFileExtension(HoodieLogFile.DELTA_EXTENSION).build();
+                            Long numRollbackBlocks = 0L;
+                            // generate metadata
+                            Map<HeaderMetadataType, String> header =
+                                Maps.newHashMap();
+                            header.put(HeaderMetadataType.INSTANT_TIME,
+                                metaClient.getActiveTimeline().lastInstant().get().getTimestamp());
+                            header.put(HeaderMetadataType.TARGET_INSTANT_TIME,
+                                commit);
+                            header.put(HeaderMetadataType.COMMAND_BLOCK_TYPE, String
+                                .valueOf(
+                                    HoodieCommandBlockTypeEnum
+                                        .ROLLBACK_PREVIOUS_BLOCK
+                                        .ordinal()));
+                            // if update belongs to an existing log file
+                            writer = writer.appendBlock(new HoodieCommandBlock(header));
+                            numRollbackBlocks++;
+                            filesToNumBlocksRollback.put(this.getMetaClient().getFs()
+                                .getFileStatus(writer.getLogFile().getPath()), numRollbackBlocks);
+                          } catch (IOException | InterruptedException io) {
+                            throw new HoodieRollbackException(
+                                "Failed to rollback for commit " + commit, io);
+                          } finally {
+                            try {
+                              writer.close();
+                            } catch (IOException io) {
+                              throw new UncheckedIOException(io);
+                            }
+                          }
+                        });
+                    hoodieRollbackStats = HoodieRollbackStat.newBuilder()
+                        .withPartitionPath(partitionPath)
+                        .withDeletedFileResults(filesToDeletedStatus)
+                        .withRollbackBlockAppendResults(filesToNumBlocksRollback).build();
+                  }
+                  break;
+                } catch (IOException io) {
+                  throw new UncheckedIOException("Failed to rollback for commit " + commit, io);
+                }
+              default:
+                break;
+            }
+            return hoodieRollbackStats;
+          }).collect(Collectors.toList());
+        }).flatMap(x -> x.iterator()).filter(x -> x != null).collect();
+
+    commitsAndCompactions.entrySet().stream().map(
+        entry -> new HoodieInstant(true, entry.getValue().getAction(),
+            entry.getValue().getTimestamp())).forEach(this.getActiveTimeline()::deleteInflight);
+    logger
+        .debug("Time(in ms) taken to finish rollback " + (System.currentTimeMillis() - startTime));
+
+    return allRollbackStats;
+  }
+
+  @Override
+  public Optional<Integer> finalizeWrite(JavaSparkContext jsc, List writeStatuses) {
+    // do nothing for MOR tables
+    return Optional.empty();
+  }
+
+  /**
+   * UpsertPartitioner for MergeOnRead table type, this allows auto correction of small parquet
+   * files to larger ones without the need for an index in the logFile.
+   */
+  class MergeOnReadUpsertPartitioner extends HoodieCopyOnWriteTable.UpsertPartitioner {
+
+    MergeOnReadUpsertPartitioner(WorkloadProfile profile) {
+      super(profile);
+    }
+
+    @Override
+    protected List<SmallFile> getSmallFiles(String partitionPath) {
+
+      // smallFiles only for partitionPath
+      List<SmallFile> smallFileLocations = new ArrayList<>();
+
+      // Init here since this class (and member variables) might not have been initialized
+      HoodieTimeline commitTimeline = getCompletedCommitTimeline();
+
+      if (!commitTimeline.empty()) {
+        HoodieInstant latestCommitTime = commitTimeline.lastInstant().get();
+        // find smallest file in partition and append to it
+
+        // TODO - check if index.isglobal then small files are log files too
+        Optional<FileSlice> smallFileSlice = getRTFileSystemView()
+            .getLatestFileSlicesBeforeOrOn(partitionPath, latestCommitTime.getTimestamp()).filter(
+                fileSlice -> fileSlice.getLogFiles().count() < 1
+                    && fileSlice.getDataFile().get().getFileSize() < config
+                    .getParquetSmallFileLimit()).sorted((FileSlice left, FileSlice right) ->
+                left.getDataFile().get().getFileSize() < right.getDataFile().get().getFileSize()
+                    ? -1 : 1).findFirst();
+
+        if (smallFileSlice.isPresent()) {
+          String filename = smallFileSlice.get().getDataFile().get().getFileName();
+          SmallFile sf = new SmallFile();
+          sf.location = new HoodieRecordLocation(FSUtils.getCommitTime(filename),
+              FSUtils.getFileId(filename));
+          sf.sizeBytes = smallFileSlice.get().getDataFile().get().getFileSize();
+          smallFileLocations.add(sf);
+          // Update the global small files list
+          smallFiles.add(sf);
+        }
+      }
+
+      return smallFileLocations;
+    }
+
+    public List<String> getSmallFileIds() {
+      return (List<String>) smallFiles.stream()
+          .map(smallFile -> ((SmallFile) smallFile).location.getFileId())
+          .collect(Collectors.toList());
+    }
+  }
+
+}
